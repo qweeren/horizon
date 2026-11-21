@@ -7,8 +7,9 @@ use mod_api::{
 };
 use std::sync::Mutex;
 
-/// The chunk the camera looks at; shared by the server and the window of a single-player game.
-static VIEW: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// Each player's centre the server accepted, by UUID: shared by the server and the window of a
+/// single-player game, and the window shows only its own player's.
+static VIEWS: Mutex<Vec<(u128, (i32, i32))>> = Mutex::new(Vec::new());
 
 #[derive(Default)]
 struct Fixture;
@@ -36,15 +37,29 @@ impl Hooks for Fixture {
             return Flow::Continue;
         };
         let set = player.set_view_center(host, view.map(|(x, z)| ChunkPos::new(x, z)));
-        *VIEW.lock().unwrap() = view.filter(|_| set);
+        // A refused call changed nothing on the server, so the camera stays where it was.
+        if set {
+            let mut views = VIEWS.lock().unwrap();
+            views.retain(|&(uuid, _)| uuid != event.player);
+            views.extend(view.map(|chunk| (event.player, chunk)));
+        }
         event
             .replies
             .push(Text::literal(format!("view centre {view:?}: {set}")));
         Flow::Cancel
     }
 
-    fn camera_pose(&self, _: &dyn ClientHost, event: &mut CameraPoseEvent<'_>) {
-        if let Some((x, z)) = *VIEW.lock().unwrap() {
+    fn camera_pose(&self, host: &dyn ClientHost, event: &mut CameraPoseEvent<'_>) {
+        let Some(me) = host.local_player().map(|p| p.uuid()) else {
+            return;
+        };
+        let view = VIEWS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|&&(uuid, _)| uuid == me)
+            .map(|&(_, chunk)| chunk);
+        if let Some((x, z)) = view {
             // Above the chunk, looking down on it and the ones around it.
             *event.position = [f64::from(x * 16 + 8), 160.0, f64::from(z * 16 - 40)];
             event.pitch = 50.0;
