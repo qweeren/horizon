@@ -190,10 +190,14 @@ impl Game<'_> {
             }
         }
         if let Some(p) = &self.player {
-            self.streaming.center = (
+            let own = (
                 (p.position.x.floor() as i32) >> 4,
                 (p.position.z.floor() as i32) >> 4,
             );
+            self.streaming.center = self
+                .remote
+                .as_ref()
+                .map_or(own, |r| view_center(own, r.chunk_center));
         }
         horizon_client::spans::time("tick_pregen", || self.tick_pregen());
         // A headless game has nothing to draw sections with: like a server's, they aren't
@@ -466,3 +470,29 @@ impl Game<'_> {
         }
     }
 }
+
+/// The chunk the window meshes and draws around: the player's own, unless the server centred
+/// their chunk cache well away from them (a mod's view centre, horizon-rust/horizon#19219), where
+/// the chunks it sends are. Within two chunks it is the player's: the cache centre lags a move
+/// across a chunk border by a tick, and vanilla's view area follows the camera there anyway.
+pub(in crate::game) fn view_center(own: (i32, i32), cache: (i32, i32)) -> (i32, i32) {
+    let away = (cache.0 - own.0).abs().max((cache.1 - own.1).abs());
+    if away > 2 { cache } else { own }
+}
+
+#[cfg(test)]
+mod view_center_tests {
+    use super::view_center;
+
+    #[test]
+    fn follows_the_cache_centre_only_when_it_moved_away() {
+        assert_eq!(view_center((0, 0), (0, 0)), (0, 0));
+        // A border crossing the server has not answered yet.
+        assert_eq!(view_center((5, 5), (4, 5)), (5, 5));
+        assert_eq!(view_center((5, 5), (7, 3)), (5, 5));
+        // A mod's view centre far from the player.
+        assert_eq!(view_center((5, 5), (8, 5)), (8, 5));
+        assert_eq!(view_center((0, 0), (-40, 120)), (-40, 120));
+    }
+}
+

@@ -55,6 +55,8 @@ mod raw_inbox;
 mod selector_sync;
 mod spawn_info;
 pub(super) mod terrain;
+mod view_center;
+pub use view_center::ViewCenterRefusal;
 use advancements::AdvancementOwners;
 use chat::yellow_names;
 pub use pending_move::{
@@ -1105,7 +1107,8 @@ impl Hub {
         self.guests
             .simulation_iter()
             .filter(move |g| self.watches(g) && loads(g))
-            .map(Guest::chunk)
+            // A mod's view centre loads as the player's chunk does; the player's own stays loaded.
+            .flat_map(|g| std::iter::once(g.chunk()).chain(g.view_center))
     }
     /// `PlayerList.broadcastAll(packet, dimension)`: the players in the level in place.
     pub fn broadcast_level(&self, packet: &C) {
@@ -1704,9 +1707,10 @@ impl Hub {
             });
         }
         self.send_level_info(i, ctx, true);
-        // ServerLevel.addNewPlayer: the chunk tracking starts at the player.
+        // ServerLevel.addNewPlayer: the chunk tracking starts at the player (or a mod's view
+        // centre, kept through a placement in the same level).
         self.guests.update(i, |g| {
-            let (cx, cz) = g.chunk();
+            let (cx, cz) = g.view_chunk();
             g.send(&C::SetChunkCacheCenter(play::SetChunkCacheCenter {
                 x: cx,
                 z: cz,
@@ -1759,7 +1763,7 @@ impl Hub {
         }
         let recentered = self.guests[i]
             .center
-            .is_some_and(|c| c != self.guests[i].chunk());
+            .is_some_and(|c| c != self.guests[i].view_chunk());
         if recentered {
             self.update_view(i, self.chunk_watches.recording());
         }
@@ -2861,8 +2865,8 @@ impl Hub {
         let mut batches = Vec::new();
         for i in 0..self.guests.len() {
             if self.watches(&self.guests[i]) {
-                let moved =
-                    self.terrain.is_some() && self.guests[i].center != Some(self.guests[i].chunk());
+                let moved = self.terrain.is_some()
+                    && self.guests[i].center != Some(self.guests[i].view_chunk());
                 self.update_view(i, watching);
                 if moved || self.terrain.is_some() && self.ticks <= self.guests[i].placed_at + 1 {
                     self.warm_first_terrain(i, world, ctx.streaming);
@@ -3026,7 +3030,7 @@ impl Hub {
     /// the view forgotten and the ones that entered it queued, closest first;
     /// past the view, the far ring's.
     fn update_view(&mut self, i: usize, watching: bool) {
-        let (cx, cz) = self.guests[i].chunk();
+        let (cx, cz) = self.guests[i].view_chunk();
         let r = self.guests[i].view_distance;
         let reach = self.reach(&self.guests[i]);
         if self.guests[i].center != Some((cx, cz))
@@ -5178,8 +5182,10 @@ impl Hub {
         });
         self.send_level_info(i, ctx, true);
         self.send_permission_level(i);
-        // ServerLevel.addRespawnedPlayer: the chunk tracking starts again at the player.
+        // ServerLevel.addRespawnedPlayer: the chunk tracking starts again at the player; a mod's
+        // view centre ends with the player it was set for.
         self.guests.update(i, |g| {
+            g.view_center = None;
             let (cx, cz) = g.chunk();
             g.send(&C::SetChunkCacheCenter(play::SetChunkCacheCenter {
                 x: cx,
@@ -5264,6 +5270,8 @@ impl Hub {
             // The load timer is not restarted: vanilla resets the client's loaded state on death and
             // respawn only, and covers a level change with its separate `isChangingDimension` term.
             g.center = None;
+            // A mod's view centre named a chunk of the level left.
+            g.view_center = None;
             g.yaw = yaw;
             if let Some(pitch) = pitch {
                 g.pitch = pitch;
@@ -8784,5 +8792,60 @@ mod tests {
         hub.guests.update(0, |g| g.release_tickets());
         hub.guests.update(0, |g| g.watching = false);
         assert_eq!(hub.guests[0].ticket_chunk(), left);
+    }
+    /// A mod's view centre (horizon-rust/horizon#19219): the chunk tracking moves there, the client
+    /// is told the new cache centre, the chunks around it load as the player's own do, and the
+    /// player stays where they are. `None` puts the tracking back on the player.
+    #[test]
+    fn a_view_centre_moves_the_chunk_tracking_but_not_the_player() {
+        let (mut hub, rx) = hub_with_a_guest();
+        let uuid = hub.guests[0].uuid;
+        let own = hub.guests[0].chunk();
+        let position = hub.guests[0].position;
+        hub.update_view(0, false);
+        let centres = |rx: &std::sync::mpsc::Receiver<crate::lan::Out>| -> Vec<(i32, i32)> {
+            rx.try_iter()
+                .flat_map(|out| match out {
+                    crate::lan::Out::Packet(body) => vec![body],
+                    crate::lan::Out::Packets(bodies) => bodies,
+                    _ => Vec::new(),
+                })
+                .filter_map(|body| {
+                    let mut reader = horizon_protocol::buf::Reader::new(&body);
+                    let id = reader.varint().unwrap();
+                    match play::Clientbound::decode(id, &body[reader.position()..]) {
+                        Ok(C::SetChunkCacheCenter(p)) => Some((p.x, p.z)),
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        let _ = centres(&rx);
+
+        assert_eq!(hub.set_view_center(uuid, Some((40, -12))), Ok(()));
+        hub.update_view(0, false);
+        assert_eq!(hub.guests[0].center, Some((40, -12)));
+        assert_eq!(centres(&rx), vec![(40, -12)]);
+        assert_eq!(hub.guests[0].position, position);
+        assert_eq!(hub.guests[0].ticket_chunk(), own);
+        let loading: Vec<_> = hub.loading_chunks(|_| true).collect();
+        assert!(loading.contains(&own) && loading.contains(&(40, -12)));
+        assert_eq!(hub.view_center(uuid), Some((40, -12)));
+
+        // Refused, changing nothing.
+        assert_eq!(
+            hub.set_view_center(uuid, Some((1_875_001, 0))),
+            Err(ViewCenterRefusal::OutOfRange)
+        );
+        assert_eq!(
+            hub.set_view_center(uuid + 1, Some((0, 0))),
+            Err(ViewCenterRefusal::NotOnline)
+        );
+        assert_eq!(hub.view_center(uuid), Some((40, -12)));
+
+        assert_eq!(hub.set_view_center(uuid, None), Ok(()));
+        hub.update_view(0, false);
+        assert_eq!(hub.guests[0].center, Some(own));
+        assert_eq!(centres(&rx), vec![own]);
     }
 }
