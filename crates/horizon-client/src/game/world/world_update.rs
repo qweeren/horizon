@@ -495,4 +495,3 @@ mod view_center_tests {
         assert_eq!(view_center((0, 0), (-40, 120)), (-40, 120));
     }
 }
-
