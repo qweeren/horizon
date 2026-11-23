@@ -14436,7 +14436,7 @@ def prepare_view_center(bins, *games):
     """Build the view-centre fixture (tests/view-center-mod) as a wasm mod and install it in both games, with the
     wasm std library beside the game program."""
     # The checkout's tool, run in the fixture's folder (the packager reads the mod from the working directory).
-    tool = ['cargo', 'run', '--locked', '--release', '-q', '--manifest-path', str(ROOT / 'Cargo.toml'),
+    tool = ['cargo', 'run', '--locked', '--profile', 'fast', '-q', '--manifest-path', str(ROOT / 'Cargo.toml'),
             '-p', 'cargo-horizon-mod', '--']
     std = bins / 'horizon-wasm-std.wasm'
     if not std.exists():
